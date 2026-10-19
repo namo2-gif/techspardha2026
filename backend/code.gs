@@ -1,5 +1,5 @@
 /**
- * TECHSPARDHA 2K26 - Backend (Google Apps Script) - v1.5
+ * TECHSPARDHA 2K26 - Backend (Google Apps Script) - v1.6
  *
  * Implements TechSpardha_Registration_Spec.md plus the final decisions:
  *  - Gamer Fiesta is ONE event with per-game team sizes (Events.GameSizes).
@@ -44,6 +44,14 @@
  *    (the college has discontinued it). Edit CSD_YEARS in CONFIG to change this.
  *  - migrateEcBranch(): run once if any participant was saved with the old branch value "EC".
  *
+ * v1.6 CHANGE: registration deadline.
+ *  - Registration closes automatically at REG_CLOSE_AT (20 Oct 2026, 00:00 IST).
+ *  - From that moment register is refused with the error code REGISTRATION_CLOSED and a clear message,
+ *    and get_events returns every event with open = false. The check runs on the server clock, so a
+ *    wrong clock on a student's device cannot get around it.
+ *  - A retry of a request that was already saved BEFORE the deadline still returns its success result.
+ *  - Admin actions are not affected. To extend the deadline, change REG_CLOSE_AT and redeploy.
+ *
  * SETUP (once):
  *  1. appsscript.json: set "timeZone": "Asia/Kolkata".
  *  2. Create a NEW spreadsheet that only the 1-2 owners can open (the admin sheet).
@@ -80,6 +88,12 @@ const MAX_SCREENSHOT_BYTES = 3 * 1024 * 1024;
 const MAX_TEAM_MEMBERS = 20;
 const BACKUPS_TO_KEEP = 7;
 const MIN_SHEET_ROWS = 3000;
+
+// Registration deadline (v1.6). The +05:30 offset makes this exactly 00:00 IST on 20 October 2026,
+// whatever time zone the script runs in. Change this one line to move the deadline.
+const REG_CLOSE_AT = '2026-10-20T00:00:00+05:30';
+const REG_CLOSED_MSG = 'Registration is closed. Registration for TechSpardha 2K26 ended on 20 October 2026 at 12:00 AM, ' +
+  'and no new entries are being accepted. Nothing was saved.';
 
 // Team name rules (v1.2).
 const TEAM_NAME_MIN = 2;
@@ -188,6 +202,15 @@ function jsonOut_(obj) {
 function ok_(extra) { return Object.assign({ success: true }, extra || {}); }
 function fail_(code, message, extra) { return Object.assign({ success: false, error: code, message: message }, extra || {}); }
 function err_(field, message, code) { return { field: field, message: message, code: code || 'INVALID' }; }
+
+// True once the registration deadline has passed (v1.6). Uses the server clock.
+// If REG_CLOSE_AT is ever invalid, this returns false so a typo cannot lock everyone out by accident.
+function registrationClosed_() {
+  const t = Date.parse(REG_CLOSE_AT);
+  if (isNaN(t)) return false;
+  return Date.now() >= t;
+}
+function closedResult_() { return fail_('REGISTRATION_CLOSED', REG_CLOSED_MSG); }
 
 function isTrue_(v) { return v === true || String(v).trim().toUpperCase() === 'TRUE'; }
 function normId_(v) { return String(v === null || v === undefined ? '' : v).trim().toUpperCase(); }
@@ -427,10 +450,13 @@ function readEvents_() {
     });
 }
 
+// Public list. After the deadline every event is reported as closed (v1.6),
+// so the form also shows "Registration closed" on each event card.
 function getPublicEvents_() {
+  const closed = registrationClosed_();
   return readEvents_().map(function (e) {
     return { eventId: e.eventId, name: e.name, slot: e.slot, teamMin: e.teamMin, teamMax: e.teamMax,
-      games: e.games, gameSizes: e.gameSizes, fee: e.fee, open: e.open };
+      games: e.games, gameSizes: e.gameSizes, fee: e.fee, open: closed ? false : e.open };
   });
 }
 
@@ -534,7 +560,11 @@ function preCheckRegister_(data) {
 
   const cache = CacheService.getScriptCache();
   const prev = cache.get('IDEM_' + key);
-  if (prev) return JSON.parse(prev); // retry of an already-processed request
+  if (prev) return JSON.parse(prev); // retry of an already-processed request (saved before the deadline)
+
+  // Deadline (v1.6). After the idempotency check on purpose: a student whose entry WAS saved
+  // before the deadline and who retries afterwards still sees their success result.
+  if (registrationClosed_()) return closedResult_();
 
   const cap = data.captain && typeof data.captain === 'object' ? data.captain : {};
   const capId = normId_(cap.collegeId);
@@ -628,6 +658,10 @@ function handleRegister_(data) {
   const idemKey = String(data.idempotencyKey || '');
   const prev = cache.get('IDEM_' + idemKey);
   if (prev) return JSON.parse(prev);
+
+  // Deadline (v1.6), checked again inside the lock. A request that waited for the lock
+  // while the clock passed the deadline is refused here and nothing is written.
+  if (registrationClosed_()) return closedResult_();
 
   const errors = [];
   Object.keys(data).forEach(function (k) {

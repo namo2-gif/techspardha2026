@@ -10,6 +10,8 @@ import {
   Copy,
   Check,
   MessageCircle,
+  Clock,
+  Lock,
 } from "lucide-react";
 import { Button } from "./ui/Button";
 import { Input, Select } from "./ui/Input";
@@ -50,6 +52,16 @@ import {
 
 /** Community WhatsApp group shown after a successful registration. Change the link here only. */
 const WHATSAPP_GROUP_URL = "https://chat.whatsapp.com/JDjinxL7ZyV2EMWoHo9EGx";
+
+/**
+ * Registration deadline: 20 October 2026, 00:00 IST (the +05:30 makes it exact for every visitor,
+ * whatever time zone their device is in). Keep this the same as REG_CLOSE_AT in the backend (Code.gs).
+ * The backend is the real gatekeeper; this only drives the countdown and the "closed" screen.
+ */
+const REGISTRATION_CLOSES_AT = new Date("2026-10-20T00:00:00+05:30").getTime();
+const CLOSED_TITLE = "Registration Closed";
+const CLOSED_MESSAGE =
+  "Registration for TechSpardha 2K26 closed on 20 October 2026 at 12:00 AM. We are no longer accepting new entries, so this form can no longer be submitted.";
 
 /** 1 event, 2 your details, 3 team details (team events only), 4 review & submit. All events are free: no payment step. */
 type StepId = 1 | 2 | 3 | 4;
@@ -167,6 +179,107 @@ function clearDraft() {
     /* ignore */
   }
 }
+
+// ---------------------------------------------------------------------------
+// Countdown to the registration deadline
+// ---------------------------------------------------------------------------
+
+/** Current time in ms, refreshed every second. Stops ticking once the deadline has passed. */
+function useNow(stopAt: number): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (Date.now() >= stopAt) {
+      setNow(Date.now());
+      return;
+    }
+    const id = setInterval(() => {
+      const t = Date.now();
+      setNow(t);
+      if (t >= stopAt) clearInterval(id);
+    }, 1000);
+    return () => clearInterval(id);
+  }, [stopAt]);
+  return now;
+}
+
+const pad2 = (n: number) => String(n).padStart(2, "0");
+
+interface CountdownProps {
+  remainingMs: number;
+  compact?: boolean;
+}
+
+const Countdown: React.FC<CountdownProps> = ({ remainingMs, compact }) => {
+  const total = Math.max(0, Math.floor(remainingMs / 1000));
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  const urgent = total < 3600; // under 1 hour left
+
+  const units: { label: string; value: string }[] = [
+    ...(days > 0 ? [{ label: "Days", value: pad2(days) }] : []),
+    { label: "Hours", value: pad2(hours) },
+    { label: "Min", value: pad2(minutes) },
+    { label: "Sec", value: pad2(seconds) },
+  ];
+
+  if (compact) {
+    return (
+      <div
+        role="timer"
+        aria-live="off"
+        className={cn(
+          "flex items-center justify-center gap-2 mb-8 text-xs font-semibold uppercase tracking-widest",
+          urgent ? "text-red-400" : "text-yellow-300",
+        )}
+      >
+        <Clock className="w-4 h-4 shrink-0" />
+        <span>Registration closes in</span>
+        <span className="font-mono text-sm tabular-nums">
+          {days > 0 && `${pad2(days)}d `}
+          {pad2(hours)}h {pad2(minutes)}m {pad2(seconds)}s
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div role="timer" aria-live="off" className="mt-6 flex flex-col items-center gap-3">
+      <p
+        className={cn(
+          "flex items-center gap-2 text-xs font-bold uppercase tracking-[0.25em]",
+          urgent ? "text-red-400" : "text-yellow-300",
+        )}
+      >
+        <Clock className="w-4 h-4" />
+        Registration closes in
+      </p>
+      <div className="flex items-stretch justify-center gap-2 sm:gap-3">
+        {units.map((u) => (
+          <div
+            key={u.label}
+            className={cn(
+              "min-w-[64px] sm:min-w-[76px] px-3 py-3 border bg-white/5 text-center",
+              urgent ? "border-red-500/40" : "border-white/10",
+            )}
+          >
+            <div
+              className={cn(
+                "text-2xl sm:text-3xl font-mono font-bold tabular-nums",
+                urgent ? "text-red-400" : "text-cyan-400",
+              )}
+            >
+              {u.value}
+            </div>
+            <div className="text-[10px] uppercase tracking-widest text-white/40 mt-1">{u.label}</div>
+          </div>
+        ))}
+      </div>
+      <p className="text-[11px] text-white/40 tracking-wide">Deadline: 20 October 2026, 12:00 AM (midnight of 19 October)</p>
+    </div>
+  );
+};
 
 // ---------------------------------------------------------------------------
 // One person's fields (captain or member). Defined at module level so inputs keep focus.
@@ -307,6 +420,14 @@ export const RegistrationForm: React.FC = () => {
   const [notice, setNotice] = useState<string | null>(null);
   const [copiedReg, setCopiedReg] = useState(false);
 
+  // ----- registration deadline -----
+  // The countdown uses the visitor's clock. If the server says "closed" (its clock is the real one),
+  // serverClosed flips on and the form closes immediately, even if this device's clock is running slow.
+  const now = useNow(REGISTRATION_CLOSES_AT);
+  const [serverClosed, setServerClosed] = useState(false);
+  const closed = serverClosed || now >= REGISTRATION_CLOSES_AT;
+  const remainingMs = REGISTRATION_CLOSES_AT - now;
+
   const keyRef = useRef<string>(initial?.key ?? newIdempotencyKey());
   const cardRef = useRef<HTMLDivElement>(null);
   const pendingEventRef = useRef<string | null>(null);
@@ -375,10 +496,21 @@ export const RegistrationForm: React.FC = () => {
   const scrollToCard = () =>
     setTimeout(() => cardRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 0);
 
+  // ----- the deadline passes while someone is filling in the form -----
+  // The form is replaced by the closed message. Bring it into view and drop any open dialog state.
+  const closedHandledRef = useRef(false);
+  useEffect(() => {
+    if (!closed || closedHandledRef.current) return;
+    closedHandledRef.current = true;
+    setPendingGame(null);
+    setNotice(null);
+    if (!success) scrollToCard();
+  }, [closed, success]);
+
   // ----- choosing an event -----
   const chooseEvent = useCallback(
     (ev: EventInfo) => {
-      if (!ev.open) return;
+      if (closed || !ev.open) return;
       setNotice(null);
       if (success || ev.eventId !== eventId) {
         setEventId(ev.eventId);
@@ -396,7 +528,7 @@ export const RegistrationForm: React.FC = () => {
       setSuccess(null);
       setStep(2);
     },
-    [eventId, success],
+    [eventId, success, closed],
   );
 
   // ----- event cards elsewhere on the page ask us to select an event -----
@@ -405,6 +537,10 @@ export const RegistrationForm: React.FC = () => {
       const ev = events?.find((e) => e.eventId === id);
       if (!ev) return;
       pendingEventRef.current = null;
+      if (closed) {
+        setNotice(CLOSED_MESSAGE);
+        return;
+      }
       if (!ev.open) {
         setNotice(`Registration for ${ev.name} is closed.`);
         return;
@@ -420,7 +556,7 @@ export const RegistrationForm: React.FC = () => {
     };
     window.addEventListener("select-event", handler);
     return () => window.removeEventListener("select-event", handler);
-  }, [events, chooseEvent]);
+  }, [events, chooseEvent, closed]);
 
   // ----- field helpers -----
   const touch = (key: string) => setTouched((t) => (t[key] ? t : { ...t, [key]: true }));
@@ -503,7 +639,7 @@ export const RegistrationForm: React.FC = () => {
     ? normalizeCollegeId(captain.collegeId)
     : "";
   const nameCheckKey = `${teamNameClean}|${captainIdForCheck}`;
-  const nameCheckable = isTeam && step === 3 && !!teamNameClean && !teamNameFormatError(teamNameClean);
+  const nameCheckable = !closed && isTeam && step === 3 && !!teamNameClean && !teamNameFormatError(teamNameClean);
 
   useEffect(() => {
     if (!nameCheckable) return;
@@ -552,10 +688,11 @@ export const RegistrationForm: React.FC = () => {
   };
 
   const allValid =
-    !!selectedEvent && selectedEvent.open && stepValid(2) && (!isTeam || stepValid(3)) && consent;
+    !closed && !!selectedEvent && selectedEvent.open && stepValid(2) && (!isTeam || stepValid(3)) && consent;
 
   // ----- navigation -----
   const goNext = () => {
+    if (closed) return;
     setAttempted((a) => ({ ...a, [step]: true }));
     if (!stepValid(step)) {
       setTimeout(() => {
@@ -583,6 +720,11 @@ export const RegistrationForm: React.FC = () => {
   // ----- submit -----
   const handleSubmit = async () => {
     if (!selectedEvent || loading) return;
+    // Deadline passed (checked again at the moment of submitting): nothing is sent.
+    if (Date.now() >= REGISTRATION_CLOSES_AT) {
+      setServerClosed(true);
+      return;
+    }
     if (!allValid) {
       setAttempted((a) => ({ ...a, 4: true }));
       return;
@@ -615,6 +757,13 @@ export const RegistrationForm: React.FC = () => {
       return;
     }
 
+    // The server says registration has closed (its clock decides): show the closed screen right away.
+    if (String(res.error) === "REGISTRATION_CLOSED") {
+      setServerClosed(true);
+      void loadEvents();
+      return;
+    }
+
     const list = res.errors?.map((e) => e.message) ?? [];
     setSubmitError({ message: res.message, list, retry: RETRYABLE.includes(res.error) });
     if (res.error === "EVENT_NOT_FOUND" || res.errors?.some((e) => e.code === "EVENT_CLOSED")) void loadEvents();
@@ -625,6 +774,7 @@ export const RegistrationForm: React.FC = () => {
   };
 
   const startAnother = () => {
+    if (closed) return;
     setSuccess(null);
     setEventId("");
     setStep(1);
@@ -1015,6 +1165,45 @@ export const RegistrationForm: React.FC = () => {
   };
 
   // -------------------------------------------------------------------------
+  // Registration closed screen: replaces the whole form once the deadline passes.
+  // -------------------------------------------------------------------------
+
+  const renderClosed = () => (
+    <div className="text-center py-8 space-y-8" role="alert">
+      <div className="flex justify-center">
+        <div className="w-24 h-24 bg-red-500/10 border border-red-500/40 rounded-full flex items-center justify-center">
+          <Lock className="w-11 h-11 text-red-400" />
+        </div>
+      </div>
+
+      <div className="space-y-4">
+        <h3 className="text-3xl font-display font-bold uppercase text-red-400">{CLOSED_TITLE}</h3>
+        <p className="text-white/70 max-w-lg mx-auto leading-relaxed">{CLOSED_MESSAGE}</p>
+      </div>
+
+      <div className="max-w-lg mx-auto p-4 bg-white/5 border border-white/10 text-sm text-white/60 leading-relaxed">
+        If you submitted your registration before the deadline, you do not need to do anything. Your Registration ID
+        was shown on screen when you confirmed.
+      </div>
+
+      <div className="flex flex-col sm:flex-row flex-wrap gap-4 justify-center">
+        <a
+          href={WHATSAPP_GROUP_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex items-center justify-center gap-2 px-6 py-3 bg-green-600 hover:bg-green-500 text-white text-sm font-bold uppercase tracking-widest transition-colors"
+        >
+          <MessageCircle className="w-4 h-4" />
+          Join WhatsApp Group
+        </a>
+      </div>
+      <p className="text-[10px] text-white/40 uppercase tracking-widest">
+        Join the WhatsApp group for event updates and announcements.
+      </p>
+    </div>
+  );
+
+  // -------------------------------------------------------------------------
   // Printable confirmation slip.
   // It is rendered through a portal straight into <body> (outside #root) so the print
   // stylesheet can hide the entire website with `body > *:not(#printable-slip)` and the
@@ -1234,10 +1423,17 @@ export const RegistrationForm: React.FC = () => {
               <MessageCircle className="w-4 h-4" />
               WhatsApp Group
             </a>
-            <Button variant="outline" onClick={startAnother}>
-              Register for another event
-            </Button>
+            {!closed && (
+              <Button variant="outline" onClick={startAnother}>
+                Register for another event
+              </Button>
+            )}
           </div>
+          {closed && (
+            <p className="text-xs text-red-400/80 max-w-md mx-auto leading-relaxed">
+              Registration has now closed, so no further events can be added.
+            </p>
+          )}
           <p className="text-[10px] text-white/40 uppercase tracking-widest">
             Join the WhatsApp group for event updates and announcements.
           </p>
@@ -1250,7 +1446,8 @@ export const RegistrationForm: React.FC = () => {
   };
 
   const renderStep = () => {
-    if (success) return renderSuccess();
+    if (success) return renderSuccess(); // someone who just registered keeps their confirmation, even after the deadline
+    if (closed) return renderClosed();
     switch (step) {
       case 1:
         return renderEventStep();
@@ -1271,13 +1468,18 @@ export const RegistrationForm: React.FC = () => {
             <h2 className="text-4xl md:text-6xl font-bold mb-6">
               Join the <span className="text-cyan-500">Battle</span>
             </h2>
-            <p className="text-white/60 max-w-xl mx-auto uppercase tracking-widest text-sm">
-              Secure your spot in TechSpardha 2K26. Follow the steps below.
-            </p>
-            <p className="mt-4 text-center text-sm font-semibold uppercase tracking-widest text-red-400">
-              <span aria-hidden="true" className="mr-2">⚠</span>
-              Last date to register: <span className="whitespace-nowrap">20 October</span>
-            </p>
+            {closed ? (
+              <p className="text-red-400 max-w-xl mx-auto uppercase tracking-widest text-sm font-semibold">
+                Registration for TechSpardha 2K26 is now closed.
+              </p>
+            ) : (
+              <>
+                <p className="text-white/60 max-w-xl mx-auto uppercase tracking-widest text-sm">
+                  Secure your spot in TechSpardha 2K26. Follow the steps below.
+                </p>
+                <Countdown remainingMs={remainingMs} />
+              </>
+            )}
           </div>
 
           {notice && (
@@ -1293,20 +1495,23 @@ export const RegistrationForm: React.FC = () => {
           )}
 
           <div ref={cardRef} className="bg-neutral-900 border border-white/10 p-5 sm:p-8 md:p-12 relative scroll-mt-24">
-            {!success && (
-              <div className="flex items-center gap-4 mb-12">
-                {steps.map((s) => (
-                  <div
-                    key={s}
-                    className={cn("flex-1 h-1 transition-all duration-500", step >= s ? "bg-cyan-500" : "bg-white/10")}
-                  />
-                ))}
-              </div>
+            {!success && !closed && (
+              <>
+                <Countdown remainingMs={remainingMs} compact />
+                <div className="flex items-center gap-4 mb-12">
+                  {steps.map((s) => (
+                    <div
+                      key={s}
+                      className={cn("flex-1 h-1 transition-all duration-500", step >= s ? "bg-cyan-500" : "bg-white/10")}
+                    />
+                  ))}
+                </div>
+              </>
             )}
 
             <AnimatePresence mode="wait">
               <motion.div
-                key={success ? "success" : step}
+                key={success ? "success" : closed ? "closed" : step}
                 initial={{ opacity: 0, x: 20 }}
                 animate={{ opacity: 1, x: 0 }}
                 exit={{ opacity: 0, x: -20 }}
